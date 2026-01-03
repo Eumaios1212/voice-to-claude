@@ -1,4 +1,4 @@
-#!/home/eumaios/.local/share/voice-claude/venv/bin/python3
+#!/usr/bin/env python3
 """
 Voice Claude Daemon - Wake word activated voice input for Claude Code
 

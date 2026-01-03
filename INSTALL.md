@@ -49,7 +49,7 @@ sudo udevadm trigger
 ## Step 2: Build whisper.cpp
 
 ```bash
-cd /mnt/md0/repos  # or your preferred location
+cd ~/repos  # or your preferred location
 
 # Clone whisper.cpp
 git clone https://github.com/ggerganov/whisper.cpp
