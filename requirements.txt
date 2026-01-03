@@ -1,0 +1,6 @@
+# Voice Claude Python Dependencies
+openwakeword>=0.4.0
+pyaudio>=0.2.13
+numpy>=1.20.0
+PyYAML>=6.0
+silero-vad-lite>=0.2.0

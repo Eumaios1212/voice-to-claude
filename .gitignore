@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Temp/runtime files
+*.wav
+*.tmp
+/tmp/
+
+# Large models (not in repo, documented separately)
+ggml-*.bin
+
+# Generated files
+systemd/voice-claude.service
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config (users create their own)
+config/config.yaml

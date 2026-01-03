@@ -1,0 +1,8 @@
+#!/bin/bash
+# voice-claude-stop - Stop the voice-claude daemon
+#
+# Usage: voice-claude-stop
+#
+# Note: No popup notifications - the tray icon shows current state
+
+systemctl --user stop voice-claude

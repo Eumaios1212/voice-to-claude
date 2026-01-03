@@ -1,0 +1,19 @@
+#!/bin/bash
+# voice-claude-toggle - Toggle the voice-claude daemon mute state
+#
+# Usage: voice-claude-toggle
+# Shortcut: Super+M
+#
+# Sends SIGUSR1 to the daemon to toggle mute/unmute.
+# The tray icon will update to show the current state.
+
+# Get the daemon PID
+PID=$(systemctl --user show -p MainPID --value voice-claude)
+
+if [[ "$PID" -gt 0 ]]; then
+    # Daemon is running - send toggle signal
+    kill -USR1 "$PID"
+else
+    # Daemon not running - start it
+    systemctl --user start voice-claude
+fi

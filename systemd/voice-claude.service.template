@@ -1,0 +1,26 @@
+[Unit]
+Description=Voice Claude Daemon - Wake word activated voice input
+Documentation=https://github.com/eumaios1212/voice-to-claude
+After=graphical-session.target pulseaudio.service
+Wants=pulseaudio.service
+
+[Service]
+Type=simple
+# Ensure mic volume is at 100% (fixes mute/unmute not restoring volume)
+# Adjust card number (-c) as needed for your system
+ExecStartPre=-/usr/bin/amixer -c 2 set Mic 100%%
+ExecStart=VENV_PATH/bin/python3 %h/.local/bin/voice-claude-daemon
+Restart=on-failure
+RestartSec=5
+
+# Environment for audio and display access
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=LD_LIBRARY_PATH=%h/.local/lib
+
+# Resource limits
+Nice=10
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+#!/bin/bash
+# voice-claude-start - Start the voice-claude daemon
+#
+# Usage: voice-claude-start
+#
+# Note: No popup notifications - the tray icon shows current state
+# The systemd service has ExecStartPre that restores mic volume.
+
+systemctl --user start voice-claude

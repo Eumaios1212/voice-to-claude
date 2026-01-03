@@ -1,0 +1,732 @@
+#!/home/eumaios/.local/share/voice-claude/venv/bin/python3
+"""
+Voice Claude Daemon - Wake word activated voice input for Claude Code
+
+Usage:
+    voice-claude-daemon              # Run with tray icon
+    voice-claude-daemon --debug      # Show detailed output
+    voice-claude-daemon --no-tray    # Run without tray icon
+
+Wake words: "OK Claude" (activates listening), "Execute" (presses Enter)
+
+Flow:
+    IDLE (listening for wake word)
+      ↓ "OK Claude" detected
+    LISTENING (recording with VAD)
+      ↓ silence detected (speech ended)
+    TRANSCRIBING (whisper processing)
+      ↓ text ready
+    TYPING (ydotool injection)
+      ↓ done
+    IDLE (back to wake word detection)
+"""
+
+import os
+import re
+import sys
+import time
+import wave
+import tempfile
+import subprocess
+import argparse
+import threading
+import signal
+from enum import Enum
+from pathlib import Path
+from threading import Lock
+
+import yaml
+import pyaudio
+import numpy as np
+from openwakeword.model import Model
+from silero_vad_lite import SileroVAD
+
+# GTK/Tray imports
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('AyatanaAppIndicator3', '0.1')
+from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator3
+
+# Suppress ONNX CUDA warning
+import warnings
+warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider.*")
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+CONFIG_PATH = Path.home() / ".config" / "voice-claude" / "config.yaml"
+
+def load_config():
+    """Load configuration from YAML file with defaults."""
+    defaults = {
+        'whisper': {
+            'cli': '~/.local/bin/whisper-cli',
+            'model': '~/.local/share/whisper/models/ggml-small.en.bin',
+        },
+        'wake_words': {
+            'models_dir': '~/.local/share/voice-claude/models',
+            'ok_claude': '~/.local/share/voice-claude/models/ok_claude.onnx',
+            'execute': '~/.local/share/voice-claude/models/execute.onnx',
+            'ok_claude_threshold': 0.5,
+            'execute_threshold': 0.5,
+            'cooldown': 2.0,
+        },
+        'audio': {
+            'sample_rate': 16000,
+            'channels': 1,
+            'chunk_size': 1280,
+            'device': None,
+        },
+        'vad': {
+            'silence_threshold': 500,  # Legacy: energy-based (unused with Silero)
+            'speech_threshold': 0.5,   # Silero VAD: probability threshold
+            'silence_duration': 1.5,
+            'max_recording': 30.0,
+        },
+    }
+
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH) as f:
+            user_config = yaml.safe_load(f) or {}
+        # Merge user config with defaults
+        for key in defaults:
+            if key in user_config:
+                if isinstance(defaults[key], dict):
+                    defaults[key].update(user_config[key])
+                else:
+                    defaults[key] = user_config[key]
+
+    return defaults
+
+def expand_path(path_str):
+    """Expand ~ and return Path object."""
+    return Path(os.path.expanduser(path_str))
+
+# Load config
+CONFIG = load_config()
+
+# Whisper paths
+WHISPER_CLI = expand_path(CONFIG['whisper']['cli'])
+WHISPER_MODEL = expand_path(CONFIG['whisper']['model'])
+
+# Audio settings
+SAMPLE_RATE = CONFIG['audio']['sample_rate']
+CHANNELS = CONFIG['audio']['channels']
+CHUNK_SIZE = CONFIG['audio']['chunk_size']
+FORMAT = pyaudio.paInt16
+AUDIO_DEVICE_NAME = CONFIG['audio']['device']
+
+# Wake word settings
+WAKE_WORD = "ok_claude"
+WAKE_WORD_MODEL_PATH = str(expand_path(CONFIG['wake_words']['ok_claude']))
+WAKE_THRESHOLD = CONFIG['wake_words']['ok_claude_threshold']
+
+EXECUTE_WORD = "execute"
+EXECUTE_MODEL_PATH = str(expand_path(CONFIG['wake_words']['execute']))
+EXECUTE_THRESHOLD = CONFIG['wake_words']['execute_threshold']
+
+WAKE_COOLDOWN = CONFIG['wake_words']['cooldown']
+
+# VAD settings (Silero neural network)
+SPEECH_THRESHOLD = CONFIG['vad'].get('speech_threshold', 0.5)
+SILENCE_DURATION = CONFIG['vad']['silence_duration']
+MAX_RECORDING = CONFIG['vad']['max_recording']
+SILERO_CHUNK_SIZE = 512  # Required by Silero VAD: 512 samples @ 16kHz = 32ms
+
+# =============================================================================
+# State Machine
+# =============================================================================
+
+class State(Enum):
+    IDLE = "idle"
+    LISTENING = "listening"
+    TRANSCRIBING = "transcribing"
+    TYPING = "typing"
+    MUTED = "muted"
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def find_audio_device(audio: pyaudio.PyAudio, device_name: str) -> int:
+    """Find audio device index by name (partial match)"""
+    for i in range(audio.get_device_count()):
+        info = audio.get_device_info_by_index(i)
+        if info['maxInputChannels'] > 0 and device_name.lower() in info['name'].lower():
+            return i
+    return None
+
+def transcribe(wav_path: str, debug: bool = False) -> str:
+    """Transcribe audio file using whisper.cpp"""
+    try:
+        result = subprocess.run(
+            [
+                str(WHISPER_CLI),
+                "-m", str(WHISPER_MODEL),
+                "-f", wav_path,
+                "-t", "4",  # threads
+                "--no-timestamps",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        if debug:
+            print(f"Whisper stderr: {result.stderr[:500]}")
+
+        # Extract text from output
+        lines = result.stdout.strip().split('\n')
+        text_lines = [l.strip() for l in lines if l.strip() and not l.startswith('[')]
+        return ' '.join(text_lines)
+
+    except subprocess.TimeoutExpired:
+        return ""
+    except Exception as e:
+        if debug:
+            print(f"Transcription error: {e}")
+        return ""
+
+def convert_punctuation(text: str) -> str:
+    """Convert spoken punctuation words to symbols.
+
+    Examples:
+        "Hello comma how are you question mark" -> "Hello, how are you?"
+        "Send email period Thanks exclamation point" -> "Send email. Thanks!"
+    """
+    # Order matters: longer phrases first to avoid partial matches
+    replacements = [
+        # Sentence endings
+        (" question mark", "?"),
+        (" exclamation point", "!"),
+        (" exclamation mark", "!"),
+        (" full stop", "."),
+        (" period", "."),
+
+        # Pauses and separators
+        (" semicolon", ";"),
+        (" colon", ":"),
+        (" comma", ","),
+        (" dash", " -"),
+        (" hyphen", "-"),
+
+        # Quotes and parentheses
+        (" open quote", ' "'),
+        (" close quote", '"'),
+        (" open paren", " ("),
+        (" close paren", ")"),
+        (" left paren", " ("),
+        (" right paren", ")"),
+
+        # Special
+        (" new line", "\n"),
+        (" new paragraph", "\n\n"),
+        (" ellipsis", "..."),
+    ]
+
+    for spoken, symbol in replacements:
+        text = text.replace(spoken, symbol)
+
+    # Capitalize first letter after sentence-ending punctuation
+    text = re.sub(r'([.!?])\s+([a-z])', lambda m: m.group(1) + ' ' + m.group(2).upper(), text)
+
+    return text
+
+def type_text(text: str, debug: bool = False):
+    """Type text into focused window using ydotool
+
+    Safety measures:
+    - Max 1000 characters to prevent runaway typing
+    - 50ms key-delay to ensure proper key release (fixes repeat bug)
+    - 100ms initial delay for focus stability
+    - Newlines converted to spaces
+    - Spoken punctuation converted to symbols
+    """
+    if not text:
+        return
+
+    # Convert spoken punctuation to symbols (before other processing)
+    text = convert_punctuation(text)
+
+    # Safety: limit text length
+    MAX_LENGTH = 1000
+    if len(text) > MAX_LENGTH:
+        text = text[:MAX_LENGTH] + "... [truncated]"
+
+    # Safety: replace newlines with spaces (unless user explicitly said "new line")
+    # Note: convert_punctuation already handles "new line" -> "\n"
+    text = text.replace('\n', ' ').replace('\r', '')
+
+    # Strip extra whitespace
+    text = ' '.join(text.split())
+
+    if debug:
+        print(f"Typing {len(text)} chars: {text[:80]}...")
+
+    try:
+        subprocess.run(
+            [
+                "ydotool", "type",
+                "--delay", "100",       # 100ms delay before starting
+                "--key-delay", "50",    # 50ms between keystrokes
+                text
+            ],
+            capture_output=True,
+            timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        if debug:
+            print("WARNING: ydotool timeout - possible key stuck!")
+    except Exception as e:
+        if debug:
+            print(f"ydotool error: {e}")
+
+def press_enter(debug: bool = False):
+    """Press Enter key using ydotool"""
+    if debug:
+        print("Pressing Enter key...")
+    try:
+        subprocess.run(
+            ["ydotool", "key", "--delay", "100", "Enter"],
+            capture_output=True,
+            timeout=5
+        )
+    except Exception as e:
+        if debug:
+            print(f"ydotool key error: {e}")
+
+# =============================================================================
+# Tray Icon
+# =============================================================================
+
+class TrayIcon:
+    """System tray icon for Voice Claude"""
+
+    # Icon names from system theme
+    ICONS = {
+        State.IDLE: "audio-input-microphone",
+        State.LISTENING: "audio-input-microphone-high",
+        State.TRANSCRIBING: "audio-input-microphone-medium",
+        State.TYPING: "audio-input-microphone-medium",
+        State.MUTED: "audio-input-microphone-muted",
+    }
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+
+        # Create indicator
+        self.indicator = AppIndicator3.Indicator.new(
+            "voice-claude",
+            self.ICONS[State.IDLE],
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+        )
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
+        # Create menu
+        self.menu = Gtk.Menu()
+
+        # Status item (not clickable, just shows state)
+        self.status_item = Gtk.MenuItem(label="● Listening for wake word")
+        self.status_item.set_sensitive(False)
+        self.menu.append(self.status_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # Mute/Unmute toggle
+        self.mute_item = Gtk.MenuItem(label="Mute")
+        self.mute_item.connect("activate", self.on_mute_toggle)
+        self.menu.append(self.mute_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # View Logs
+        logs_item = Gtk.MenuItem(label="View Logs")
+        logs_item.connect("activate", self.on_view_logs)
+        self.menu.append(logs_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # Quit
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self.on_quit)
+        self.menu.append(quit_item)
+
+        self.menu.show_all()
+        self.indicator.set_menu(self.menu)
+
+    def update_state(self, state: State):
+        """Update icon and menu based on state"""
+        # Update icon
+        icon_name = self.ICONS.get(state, self.ICONS[State.IDLE])
+        self.indicator.set_icon(icon_name)
+
+        # Update status text
+        status_texts = {
+            State.IDLE: "● Listening for wake word",
+            State.LISTENING: "● Recording...",
+            State.TRANSCRIBING: "● Transcribing...",
+            State.TYPING: "● Typing...",
+            State.MUTED: "○ Muted",
+        }
+        self.status_item.set_label(status_texts.get(state, "Unknown"))
+
+        # Update mute button text
+        if state == State.MUTED:
+            self.mute_item.set_label("Unmute")
+        else:
+            self.mute_item.set_label("Mute")
+
+    def on_mute_toggle(self, widget):
+        """Handle mute/unmute click"""
+        if self.daemon.state == State.MUTED:
+            self.daemon.unmute()
+        else:
+            self.daemon.mute()
+
+    def on_view_logs(self, widget):
+        """Open logs in terminal"""
+        try:
+            subprocess.Popen([
+                "gnome-terminal", "--",
+                "journalctl", "--user", "-u", "voice-claude", "-f"
+            ])
+        except Exception:
+            pass
+
+    def on_quit(self, widget):
+        """Quit the daemon"""
+        self.daemon.shutdown()
+
+# =============================================================================
+# Main Daemon
+# =============================================================================
+
+class VoiceClaudeDaemon:
+    def __init__(self, debug: bool = False, use_tray: bool = True):
+        self.debug = debug
+        self.use_tray = use_tray
+        self.state = State.IDLE
+        self.last_wake_time = 0
+        self.running = True
+        self.audio_thread = None
+        self.tray = None
+        self.stream_lock = Lock()  # Thread safety for stream access
+
+        # Initialize audio
+        self.audio = pyaudio.PyAudio()
+        self.stream = None
+
+        # Find the audio device
+        self.device_index = None
+        if AUDIO_DEVICE_NAME:
+            self.device_index = find_audio_device(self.audio, AUDIO_DEVICE_NAME)
+            if self.device_index is not None:
+                info = self.audio.get_device_info_by_index(self.device_index)
+                print(f"Audio device: [{self.device_index}] {info['name']}")
+            else:
+                print(f"WARNING: Device '{AUDIO_DEVICE_NAME}' not found, using default")
+
+        # Initialize wake word models
+        print("Loading wake word models...")
+        self.wake_model = Model(wakeword_model_paths=[WAKE_WORD_MODEL_PATH, EXECUTE_MODEL_PATH])
+        print(f"Wake words: '{WAKE_WORD}' (dictation), '{EXECUTE_WORD}' (submit)")
+
+        # Initialize Silero VAD for speech endpoint detection
+        print("Loading Silero VAD model...")
+        self.vad = SileroVAD(SAMPLE_RATE)
+        print("Silero VAD ready (neural speech detection)")
+
+    def log(self, message: str):
+        """Print debug message if debug mode enabled"""
+        if self.debug:
+            print(f"[{self.state.value}] {message}")
+
+    def set_state(self, new_state: State):
+        """Update state and notify tray icon"""
+        self.state = new_state
+        if self.tray:
+            # Update tray from main thread
+            GLib.idle_add(self.tray.update_state, new_state)
+
+    def mute(self):
+        """Mute the daemon (stop listening)"""
+        self.log("Muting...")
+        self.set_state(State.MUTED)
+        self.stop_stream()
+
+    def unmute(self):
+        """Unmute the daemon (resume listening)"""
+        self.log("Unmuting...")
+        self.start_stream()
+        self.set_state(State.IDLE)
+
+    def toggle_mute(self):
+        """Toggle between muted and unmuted states"""
+        if self.state == State.MUTED:
+            self.unmute()
+        else:
+            self.mute()
+
+    def start_stream(self):
+        """Start audio input stream (thread-safe)"""
+        with self.stream_lock:
+            if self.stream is None:
+                kwargs = {
+                    'format': FORMAT,
+                    'channels': CHANNELS,
+                    'rate': SAMPLE_RATE,
+                    'input': True,
+                    'frames_per_buffer': CHUNK_SIZE,
+                }
+                if self.device_index is not None:
+                    kwargs['input_device_index'] = self.device_index
+                self.stream = self.audio.open(**kwargs)
+
+    def stop_stream(self):
+        """Stop audio input stream (thread-safe)"""
+        with self.stream_lock:
+            if self.stream:
+                try:
+                    self.stream.stop_stream()
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+
+    def read_chunk(self) -> np.ndarray:
+        """Read one chunk of audio data (thread-safe)"""
+        with self.stream_lock:
+            if self.stream is None:
+                return np.zeros(CHUNK_SIZE, dtype=np.int16)
+            try:
+                data = self.stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                return np.frombuffer(data, dtype=np.int16)
+            except Exception:
+                return np.zeros(CHUNK_SIZE, dtype=np.int16)
+
+    def detect_wake_word(self, audio_chunk: np.ndarray) -> str:
+        """Check if any wake word is detected in audio chunk."""
+        predictions = self.wake_model.predict(audio_chunk)
+
+        wake_score = predictions.get(WAKE_WORD, 0)
+        execute_score = predictions.get(EXECUTE_WORD, 0)
+
+        now = time.time()
+        if now - self.last_wake_time < WAKE_COOLDOWN:
+            return None
+
+        if wake_score > WAKE_THRESHOLD:
+            self.last_wake_time = now
+            self.log(f"Wake word '{WAKE_WORD}' detected! (score: {wake_score:.2f})")
+            return WAKE_WORD
+
+        if execute_score > EXECUTE_THRESHOLD:
+            self.last_wake_time = now
+            self.log(f"Execute word detected! (score: {execute_score:.2f})")
+            return EXECUTE_WORD
+
+        return None
+
+    def record_until_silence(self) -> str:
+        """Record audio until silence is detected using Silero VAD, return path to WAV file"""
+        frames = []
+        silence_start = None
+        recording_start = time.time()
+        audio_buffer = np.array([], dtype=np.int16)
+        should_stop = False
+
+        self.log("Recording... (speak now)")
+
+        while self.running and self.state == State.LISTENING and not should_stop:
+            chunk = self.read_chunk()
+            frames.append(chunk.tobytes())
+
+            # Accumulate audio for Silero VAD processing
+            audio_buffer = np.concatenate([audio_buffer, chunk])
+
+            # Process in Silero-sized chunks (512 samples = 32ms @ 16kHz)
+            while len(audio_buffer) >= SILERO_CHUNK_SIZE:
+                vad_chunk = audio_buffer[:SILERO_CHUNK_SIZE]
+                audio_buffer = audio_buffer[SILERO_CHUNK_SIZE:]
+
+                # Convert int16 to float32 normalized to [-1, 1] for Silero
+                vad_audio = (vad_chunk.astype(np.float32) / 32768.0).tobytes()
+                speech_prob = self.vad.process(vad_audio)
+
+                if self.debug:
+                    print(f"  VAD: {speech_prob:.2f}", end='\r')
+
+                # Check for silence (no speech detected)
+                if speech_prob < SPEECH_THRESHOLD:
+                    if silence_start is None:
+                        silence_start = time.time()
+                    elif time.time() - silence_start > SILENCE_DURATION:
+                        self.log(f"Silence detected (prob={speech_prob:.2f}), stopping recording")
+                        should_stop = True
+                        break
+                else:
+                    # Speech detected, reset silence timer
+                    silence_start = None
+
+            # Check max recording length
+            if time.time() - recording_start > MAX_RECORDING:
+                self.log("Max recording length reached")
+                break
+
+        # Save to temporary WAV file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
+
+        with wave.open(wav_path, 'wb') as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(self.audio.get_sample_size(FORMAT))
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(b''.join(frames))
+
+        # Fix WAV with ffmpeg
+        fixed_path = wav_path.replace('.wav', '_fixed.wav')
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", wav_path, "-ar", str(SAMPLE_RATE),
+                 "-ac", "1", "-c:a", "pcm_s16le", fixed_path],
+                capture_output=True,
+                timeout=10
+            )
+            os.unlink(wav_path)
+            return fixed_path
+        except Exception:
+            return wav_path
+
+    def audio_loop(self):
+        """Main audio processing loop (runs in separate thread)"""
+        try:
+            self.start_stream()
+        except Exception as e:
+            print(f"Failed to start audio stream: {e}")
+            return
+
+        while self.running:
+            try:
+                if self.state == State.MUTED:
+                    time.sleep(0.1)
+                    continue
+
+                if self.state == State.IDLE:
+                    chunk = self.read_chunk()
+                    detected = self.detect_wake_word(chunk)
+
+                    if detected == WAKE_WORD:
+                        self.set_state(State.LISTENING)
+
+                        # Flush audio buffer
+                        time.sleep(0.3)
+                        self._flush_audio_buffer()
+
+                    elif detected == EXECUTE_WORD:
+                        press_enter(debug=self.debug)
+
+                        time.sleep(0.3)
+                        self._flush_audio_buffer()
+                        self.wake_model.reset()
+
+                elif self.state == State.LISTENING:
+                    wav_path = self.record_until_silence()
+
+                    self.set_state(State.TRANSCRIBING)
+
+                    text = transcribe(wav_path, self.debug)
+
+                    try:
+                        os.unlink(wav_path)
+                    except Exception:
+                        pass
+
+                    if text:
+                        self.set_state(State.TYPING)
+                        self.log(f"Transcribed: {text}")
+                        type_text(text, debug=self.debug)
+                    else:
+                        self.log("No speech detected")
+
+                    self.set_state(State.IDLE)
+                    self.wake_model.reset()
+
+                    time.sleep(0.5)
+                    self._flush_audio_buffer()
+
+                    self.last_wake_time = time.time()
+                    self.log("Back to idle, listening for wake word...")
+
+            except Exception as e:
+                if self.debug:
+                    print(f"Error in audio loop: {e}")
+                time.sleep(0.1)  # Prevent tight loop on error
+
+        self.stop_stream()
+        self.audio.terminate()
+
+    def _flush_audio_buffer(self):
+        """Flush any pending audio data from the buffer"""
+        with self.stream_lock:
+            if self.stream is None:
+                return
+            try:
+                while self.stream.get_read_available() > 0:
+                    self.stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            except Exception:
+                pass
+
+    def shutdown(self):
+        """Shutdown the daemon"""
+        print("\nShutting down...")
+        self.running = False
+        if self.audio_thread:
+            self.audio_thread.join(timeout=2)
+        Gtk.main_quit()
+
+    def run(self):
+        """Main entry point"""
+        print("-" * 50)
+        print("Voice Claude Daemon started")
+        print("Say 'OK Claude' to dictate text")
+        print("Say 'Execute' to press Enter")
+        if self.use_tray:
+            print("Tray icon active - right-click for menu")
+        print("Press Ctrl+C to stop")
+        print("-" * 50)
+
+        # Handle signals
+        signal.signal(signal.SIGINT, lambda s, f: self.shutdown())
+        signal.signal(signal.SIGTERM, lambda s, f: self.shutdown())
+        signal.signal(signal.SIGUSR1, lambda s, f: self.toggle_mute())  # Toggle via signal
+
+        if self.use_tray:
+            # Create tray icon
+            self.tray = TrayIcon(self)
+
+            # Start audio processing in background thread
+            self.audio_thread = threading.Thread(target=self.audio_loop, daemon=True)
+            self.audio_thread.start()
+
+            # Run GTK main loop (blocks until quit)
+            Gtk.main()
+        else:
+            # No tray - run audio loop directly
+            self.audio_loop()
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Voice Claude Daemon")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--no-tray", action="store_true", help="Run without tray icon")
+    args = parser.parse_args()
+
+    daemon = VoiceClaudeDaemon(debug=args.debug, use_tray=not args.no_tray)
+    daemon.run()
+
+if __name__ == "__main__":
+    main()

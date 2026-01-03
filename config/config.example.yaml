@@ -1,0 +1,41 @@
+# Voice Claude Configuration
+# XDG-compliant paths for voice-to-claude and voice-claude-daemon
+
+# Whisper speech-to-text
+whisper:
+  cli: ~/.local/bin/whisper-cli
+  model: ~/.local/share/whisper/models/ggml-small.en.bin
+  # Fallback model (faster but less accurate)
+  model_tiny: ~/.local/share/whisper/models/ggml-tiny.en.bin
+
+# Wake word detection (OpenWakeWord)
+wake_words:
+  models_dir: ~/.local/share/voice-claude/models
+  # Custom trained models
+  ok_claude: ~/.local/share/voice-claude/models/ok_claude.onnx
+  execute: ~/.local/share/voice-claude/models/execute.onnx
+  # Detection thresholds (0.0-1.0)
+  ok_claude_threshold: 0.5
+  execute_threshold: 0.5
+  # Cooldown between detections (seconds)
+  cooldown: 2.0
+
+# Audio settings
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 1280  # 80ms at 16kHz
+  # Device: null = system default (PipeWire), or specify like "plughw:2,0"
+  device: null
+
+# Voice Activity Detection (VAD)
+vad:
+  silence_threshold: 500  # RMS threshold
+  silence_duration: 1.5   # Seconds of silence to end recording
+  max_recording: 30.0     # Max recording length in seconds
+
+# Python virtual environment
+venv: ~/.local/share/voice-claude/venv
+
+# Temporary files
+temp_dir: /tmp/voice-to-claude
