@@ -192,22 +192,21 @@ def convert_punctuation(text: str) -> str:
     """Convert spoken punctuation words to symbols.
 
     Examples:
-        "Hello comma how are you question mark" -> "Hello, how are you?"
-        "Send email period Thanks exclamation point" -> "Send email. Thanks!"
+        "Are you sure question mark" -> "Are you sure?"
+        "Wow exclamation point" -> "Wow!"
     """
     # Order matters: longer phrases first to avoid partial matches
+    # Note: "period" and "comma" removed - too many false positives
     replacements = [
         # Sentence endings
         (" question mark", "?"),
         (" exclamation point", "!"),
         (" exclamation mark", "!"),
         (" full stop", "."),
-        (" period", "."),
 
         # Pauses and separators
         (" semicolon", ";"),
         (" colon", ":"),
-        (" comma", ","),
         (" dash", " -"),
         (" hyphen", "-"),
 
