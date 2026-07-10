@@ -127,73 +127,51 @@ systemctl --user daemon-reload
 systemctl --user enable voice-claude
 systemctl --user start voice-claude
 
-# Set up keyboard shortcut (Super+M to toggle)
-echo -e "${YELLOW}Setting up keyboard shortcut (Super+M)...${NC}"
+# ensure_keybinding NAME COMMAND BINDING
+# Idempotently register a GNOME custom keyboard shortcut. Safe to re-run: if a
+# shortcut with the same COMMAND already exists, its slot is updated in place
+# instead of creating a duplicate.
+ensure_keybinding() {
+    local name="$1" command="$2" binding="$3"
+    local base="org.gnome.settings-daemon.plugins.media-keys"
+    local path_prefix="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom"
+    local existing path existing_cmd found="" slot=0 new_list
 
-# Get existing custom keybindings
-EXISTING=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null || echo "@as []")
+    existing=$(gsettings get "$base" custom-keybindings 2>/dev/null || echo "@as []")
 
-# Check if voice-claude shortcut already exists
-if [[ "$EXISTING" != *"voice-claude"* ]]; then
-    # Find next available slot (custom0, custom1, etc.)
-    SLOT=0
-    while [[ "$EXISTING" == *"custom$SLOT"* ]]; do
-        ((SLOT++))
+    # Reuse the existing slot if this command is already bound
+    for path in $(echo "$existing" | grep -oE "${path_prefix}[0-9]+/"); do
+        existing_cmd=$(gsettings get "$base.custom-keybinding:$path" command 2>/dev/null)
+        if [[ "$existing_cmd" == "'$command'" ]]; then
+            found="$path"
+            break
+        fi
     done
 
-    KEYBINDING_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom$SLOT/"
-
-    # Add to list of custom keybindings
-    if [[ "$EXISTING" == "@as []" ]]; then
-        NEW_LIST="['$KEYBINDING_PATH']"
-    else
-        # Remove trailing ] and add new entry
-        NEW_LIST="${EXISTING%]*}, '$KEYBINDING_PATH']"
+    # Otherwise claim the next free slot and append it to the list
+    if [[ -z "$found" ]]; then
+        while [[ "$existing" == *"custom$slot/"* ]]; do
+            slot=$((slot + 1))
+        done
+        found="${path_prefix}$slot/"
+        if [[ "$existing" == "@as []" ]]; then
+            new_list="['$found']"
+        else
+            # Strip trailing ] and append the new path
+            new_list="${existing%]*}, '$found']"
+        fi
+        gsettings set "$base" custom-keybindings "$new_list"
     fi
 
-    gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$NEW_LIST"
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH name 'Voice Claude Toggle'
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH command "$BIN_DIR/voice-claude-toggle"
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH binding '<Super>m'
+    gsettings set "$base.custom-keybinding:$found" name "$name"
+    gsettings set "$base.custom-keybinding:$found" command "$command"
+    gsettings set "$base.custom-keybinding:$found" binding "$binding"
+}
 
-    echo -e "${GREEN}Keyboard shortcut configured: Super+M${NC}"
-else
-    echo "Keyboard shortcut already configured"
-fi
-
-# Set up keyboard shortcut (Super+C to dictate without the wake word)
-echo -e "${YELLOW}Setting up keyboard shortcut (Super+C)...${NC}"
-
-# Re-read the list (the Super+M block above may have just added a slot)
-EXISTING=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null || echo "@as []")
-
-# Check if the dictate shortcut already exists
-if [[ "$EXISTING" != *"Voice Claude Dictate"* ]]; then
-    # Find next available slot (custom0, custom1, etc.)
-    SLOT=0
-    while [[ "$EXISTING" == *"custom$SLOT"* ]]; do
-        ((SLOT++))
-    done
-
-    KEYBINDING_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom$SLOT/"
-
-    # Add to list of custom keybindings
-    if [[ "$EXISTING" == "@as []" ]]; then
-        NEW_LIST="['$KEYBINDING_PATH']"
-    else
-        # Remove trailing ] and add new entry
-        NEW_LIST="${EXISTING%]*}, '$KEYBINDING_PATH']"
-    fi
-
-    gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$NEW_LIST"
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH name 'Voice Claude Dictate'
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH command 'systemctl --user kill --signal=SIGUSR2 voice-claude.service'
-    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH binding '<Super>c'
-
-    echo -e "${GREEN}Keyboard shortcut configured: Super+C${NC}"
-else
-    echo "Keyboard shortcut already configured"
-fi
+echo -e "${YELLOW}Setting up keyboard shortcuts (Super+M, Super+C)...${NC}"
+ensure_keybinding 'Voice Claude Toggle' "$BIN_DIR/voice-claude-toggle" '<Super>m'
+ensure_keybinding 'Voice Claude Dictate' 'systemctl --user kill --signal=SIGUSR2 voice-claude.service' '<Super>c'
+echo -e "${GREEN}Keyboard shortcuts configured: Super+M (toggle), Super+C (dictate)${NC}"
 
 echo
 echo -e "${GREEN}Installation complete!${NC}"
