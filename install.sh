@@ -161,12 +161,47 @@ else
     echo "Keyboard shortcut already configured"
 fi
 
+# Set up keyboard shortcut (Super+C to dictate without the wake word)
+echo -e "${YELLOW}Setting up keyboard shortcut (Super+C)...${NC}"
+
+# Re-read the list (the Super+M block above may have just added a slot)
+EXISTING=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null || echo "@as []")
+
+# Check if the dictate shortcut already exists
+if [[ "$EXISTING" != *"Voice Claude Dictate"* ]]; then
+    # Find next available slot (custom0, custom1, etc.)
+    SLOT=0
+    while [[ "$EXISTING" == *"custom$SLOT"* ]]; do
+        ((SLOT++))
+    done
+
+    KEYBINDING_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom$SLOT/"
+
+    # Add to list of custom keybindings
+    if [[ "$EXISTING" == "@as []" ]]; then
+        NEW_LIST="['$KEYBINDING_PATH']"
+    else
+        # Remove trailing ] and add new entry
+        NEW_LIST="${EXISTING%]*}, '$KEYBINDING_PATH']"
+    fi
+
+    gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$NEW_LIST"
+    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH name 'Voice Claude Dictate'
+    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH command 'systemctl --user kill --signal=SIGUSR2 voice-claude.service'
+    gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYBINDING_PATH binding '<Super>c'
+
+    echo -e "${GREEN}Keyboard shortcut configured: Super+C${NC}"
+else
+    echo "Keyboard shortcut already configured"
+fi
+
 echo
 echo -e "${GREEN}Installation complete!${NC}"
 echo
 echo -e "${GREEN}Voice Claude is now running. Try saying 'OK Claude' to test.${NC}"
 echo
 echo "Commands:"
+echo "  Super+C                                 # Dictate now (skip the wake word)"
 echo "  Super+M                                 # Toggle listening on/off"
 echo "  systemctl --user status voice-claude   # Check status"
 echo "  journalctl --user -u voice-claude -f   # View logs"

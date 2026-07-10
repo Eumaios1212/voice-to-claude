@@ -467,6 +467,16 @@ class VoiceClaudeDaemon:
         else:
             self.mute()
 
+    def trigger_listen(self):
+        """Hotkey-triggered dictation: skip the wake word and start recording.
+
+        Only fires from IDLE. If muted, ignored (hardware/software mute wins);
+        if already listening/transcribing, ignored to avoid interrupting a cycle.
+        """
+        if self.state == State.IDLE:
+            self.log("Hotkey trigger - listening")
+            self.set_state(State.LISTENING)
+
     def start_stream(self):
         """Start audio input stream (thread-safe)"""
         with self.stream_lock:
@@ -699,6 +709,7 @@ class VoiceClaudeDaemon:
         signal.signal(signal.SIGINT, lambda s, f: self.shutdown())
         signal.signal(signal.SIGTERM, lambda s, f: self.shutdown())
         signal.signal(signal.SIGUSR1, lambda s, f: self.toggle_mute())  # Toggle via signal
+        signal.signal(signal.SIGUSR2, lambda s, f: self.trigger_listen())  # Hotkey dictate
 
         if self.use_tray:
             # Create tray icon

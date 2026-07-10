@@ -5,6 +5,7 @@ Hands-free voice input for Claude Code on Linux. Speak naturally and have your w
 ## Features
 
 - **Wake Word Activation**: Say "OK Claude" to start dictating
+- **Hotkey Dictation**: Press `Super+C` to start dictating without the wake word
 - **Submit Command**: Say "Execute" to press Enter and submit
 - **Fast Transcription**: ~1.8s latency using whisper.cpp with GPU acceleration
 - **Smart Silence Detection**: Silero VAD neural network distinguishes speech from background noise
@@ -45,9 +46,14 @@ The daemon runs automatically after installation:
 
 ```
 "OK Claude"  → Start listening, speak your message
+Super+C      → Start listening now, without the wake word
 [silence]    → Transcription starts automatically
 "Execute"    → Press Enter to submit
 ```
+
+> **Hotkey vs wake word**: `Super+C` jumps straight to recording (only when idle —
+> it won't override a mute or interrupt an in-progress dictation). The "OK Claude"
+> wake word still works in parallel.
 
 ### Manual Control
 
