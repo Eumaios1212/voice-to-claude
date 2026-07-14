@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hotkey dictation: `Super+C` starts a dictation without the "OK Claude" wake
   word (SIGUSR2 signal to the daemon; fires only from idle). `install.sh` now
   configures this shortcut alongside Super+M.
+- Custom vocabulary support (`whisper.prompt`): optional initial prompt passed
+  to whisper.cpp as `--prompt`, biasing transcription toward domain terms.
+- Word replacements (`whisper.replacements`): deterministic post-processing
+  that rewrites consistently-misheard words/phrases (whole-word,
+  case-insensitive, capitalization-aware). Both features default off.
 
 ## [1.0.0] - 2026-01-03
 

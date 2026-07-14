@@ -7,6 +7,16 @@ whisper:
   model: ~/.local/share/whisper/models/ggml-small.en.bin
   # Fallback model (faster but less accurate)
   model_tiny: ~/.local/share/whisper/models/ggml-tiny.en.bin
+  # Optional: initial prompt biases transcription toward domain vocabulary.
+  # Probabilistic — improves recognition of unusual terms, not guaranteed.
+  # prompt: "Vocabulary: kubectl, systemd, PipeWire, tmux."
+  # Optional: deterministic fixes for words Whisper consistently mishears
+  # ({heard: intended}, whole-word, case-insensitive). A capitalized match
+  # keeps its capital unless the intended word contains non-letters (handles,
+  # paths), which are inserted verbatim. Caveat: a heard word can no longer
+  # be dictated literally.
+  # replacements:
+  #   cooba netties: kubernetes
 
 # Wake word detection (OpenWakeWord)
 wake_words:
