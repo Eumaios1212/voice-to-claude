@@ -97,6 +97,32 @@ voice-claude-start    # Start the daemon
 > - Muted state = no audio processed (true privacy)
 > - Starting the daemon auto-restores mic volume (fixes Ubuntu mute/unmute bug)
 
+### Custom Vocabulary
+
+Whisper often mishears project names, handles, and technical jargon. Two
+config options address this (both optional; edit
+`~/.config/voice-claude/config.yaml`, then restart the daemon):
+
+```yaml
+whisper:
+  # Bias transcription toward domain vocabulary (probabilistic)
+  prompt: "Vocabulary: kubectl, systemd, PipeWire, tmux."
+
+  # Deterministically rewrite words Whisper consistently gets wrong
+  replacements:
+    cooba netties: kubernetes
+    my handle: myhandle42
+```
+
+- **`prompt`** is passed to whisper.cpp as `--prompt`, making listed words more
+  likely outputs. It helps most with multi-syllable terms; it can lose to
+  phonetics when the misheard word is a common English word.
+- **`replacements`** run as post-processing: whole-word, case-insensitive, and
+  multi-word phrases are supported. A capitalized match keeps its capital
+  unless the intended word contains non-letters (handles like `myhandle42`,
+  tokens like `origin/dev`), which are inserted verbatim. The trade-off: a
+  replaced word can never be dictated literally again.
+
 ## File Locations
 
 | File | Purpose |
